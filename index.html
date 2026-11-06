@@ -445,26 +445,32 @@ function bldCost(S, k) {
 }
 const canPay = (S, c) => Object.keys(c).every(r => S.res[r] >= c[r]);
 function pay(S, c) { for (const r in c) S.res[r] -= c[r]; }
-const landUsed = S => Object.keys(S.bld).filter(k => S.bld[k] > 0).length;
+/* 能多建的建筑：多一座算多一级的效果，要占一块地；座数受主堡等级限制 */
+const COPYABLE = { farm: 1, lumber: 1, mine: 1, house: 1, barracks: 1 };
+const copies = (S, k) => ((S.extra && S.extra[k]) || []).length;
+const eff = (S, k) => S.bld[k] + copies(S, k);
+const copyMax = S => S.castle - 1;
+function copyCost(S, k) { const m = copies(S, k) + 2, c = {}; for (const r in BUILD[k].cost) c[r] = BUILD[k].cost[r] * m; return c; }
+const landUsed = S => Object.keys(S.bld).filter(k => S.bld[k] > 0).length + Object.keys(S.extra || {}).reduce((a, k) => a + copies(S, k), 0);
 function landMax(S) {
-  return 7 + S.reclaim + S.t.filter((t, i) => t.own === 'me' && ['village', 'lumber', 'mine'].includes(MAP[i].type)).length;
+  return 7 + S.reclaim + (S.castle - 1) * 2 + S.t.filter((t, i) => t.own === 'me' && ['village', 'lumber', 'mine'].includes(MAP[i].type)).length;
 }
 const reclaimCost = S => ({ wood: 40 + S.reclaim * 30, food: 30 });
-const workerCap = (S, k) => 6 + 4 * S.bld[k];
-const popCap = S => 40 + 25 * S.bld.house + S.t.reduce((a, t, i) => a + (t.own === 'me' ? (TYPES[MAP[i].type].cap || 0) : 0), 0);
+const workerCap = (S, k) => 6 + 4 * eff(S, k);
+const popCap = S => 40 + 25 * eff(S, 'house') + S.t.reduce((a, t, i) => a + (t.own === 'me' ? (TYPES[MAP[i].type].cap || 0) : 0), 0);
 const idle = S => S.pop - S.work.farm - S.work.lumber - S.work.mine;
 const soldiersAll = S => S.troops.length + S.garTotal;
 const moraleMul = S => .55 + S.morale / 110;
-const trainMax = S => Math.max(1, 3 + 2 * S.bld.barracks + garSum(S, 'train') - (S.morale < 40 ? 2 : 0));
+const trainMax = S => Math.max(1, 3 + 2 * eff(S, 'barracks') + garSum(S, 'train') - (S.morale < 40 ? 2 : 0));
 const fixWork = S => { for (const k of ['mine', 'lumber', 'farm']) { const over = S.work.farm + S.work.lumber + S.work.mine - S.pop; if (over > 0) S.work[k] = Math.max(0, S.work[k] - over); } };
 function garSum(S, k) {
   return S.heroes.reduce((a, h) => { const g = HEROES[h.id].gar; return a + (g && g.k === k && !h.away && !h.wound ? g.v : 0); }, 0);
 }
 function income(S) {
   const m = moraleMul(S), r = { food: 0, wood: 0, iron: 0, gold: 0 };
-  r.food += S.work.farm * (3 + S.bld.farm) * m;
-  r.wood += S.work.lumber * (2 + S.bld.lumber) * m;
-  r.iron += S.work.mine * (1 + .5 * S.bld.mine) * m;
+  r.food += S.work.farm * (3 + eff(S, 'farm')) * m;
+  r.wood += S.work.lumber * (2 + eff(S, 'lumber')) * m;
+  r.iron += S.work.mine * (1 + .5 * eff(S, 'mine')) * m;
   r.gold += Math.max(0, idle(S)) * 1 * m;
   S.t.forEach((t, i) => { if (t.own !== 'me') return; const mo = TYPES[MAP[i].type].month; if (mo) for (const k in mo) r[k] += mo[k]; });
   for (const k of ['food', 'wood', 'iron', 'gold']) r[k] += garSum(S, k);
@@ -985,7 +991,7 @@ function endTurn(S) {
     S.res.food = 0; S.morale = clamp(S.morale - 8, 0, 100);
   } else {
     const cap = popCap(S), total = S.pop + soldiersAll(S);
-    if (total < cap) { const g = Math.min(cap - total, Math.max(1, Math.round((1 + S.bld.house) * moraleMul(S)))); S.pop += g; }
+    if (total < cap) { const g = Math.min(cap - total, Math.max(1, Math.round((1 + eff(S, 'house')) * moraleMul(S)))); S.pop += g; }
     if (S.morale < 60) S.morale += 1;
     if (S.morale > 60 && Math.random() < .3) S.morale -= 1;
   }
@@ -1458,22 +1464,43 @@ function makeLay() {
 const LAY = makeLay();
 /* 自己摆的位置存在存档 S.base 里，没动过的用默认位置 */
 const lotUV = k => (S.base && S.base[k]) || LOTS[k];
-function setSpot(k, u, v) {
-  const L = LAY, d = LOTS[k], [x, y] = A(u, v); L.spots[k] = [x, y + d[3], d[2]];
-  if (k === 'cata') L.catas = [[x - 54, y + 4], [x + 54, y + 4], [x, y + 34]];
-  if (k === 'lumber' || k === 'mine') L.routes[k][0] = L.spots[k];
+const baseOf = id => id.split('#')[0];
+function allLots() { // 地图上实际占着地的东西；副本的 id 形如 barracks#0
+  const out = [];
+  Object.keys(LOTS).forEach(k => {
+    if (k === 'keep' || k === 'yard' || S.bld[k] > 0) { const [u, v] = lotUV(k); out.push({ id: k, k, u, v }); }
+    ((S.extra && S.extra[k]) || []).forEach((q, i) => out.push({ id: `${k}#${i}`, k, u: q[0], v: q[1] }));
+  });
+  return out;
 }
-function placeAll() { Object.keys(LOTS).forEach(k => { const [u, v] = lotUV(k); setSpot(k, u, v); }); }
-function canPlace(k, u, v) { // 不出地块、不压城墙、和别的建筑至少隔一格
-  const h = BD[k].n / 2, u0 = u - h, u1 = u + h, v0 = v - h, v1 = v + h;
+function setSpot(id, u, v) {
+  const L = LAY, k = baseOf(id), d = LOTS[k], [x, y] = A(u, v); L.spots[id] = [x, y + d[3], d[2]];
+  if (id === 'cata') L.catas = [[x - 54, y + 4], [x + 54, y + 4], [x, y + 34]];
+  if (id === 'lumber' || id === 'mine') L.routes[id][0] = L.spots[id];
+}
+function placeAll() {
+  Object.keys(LAY.spots).forEach(id => { if (id.includes('#')) delete LAY.spots[id]; });
+  Object.keys(LOTS).forEach(k => { const [u, v] = lotUV(k); setSpot(k, u, v); });
+  allLots().forEach(l => { if (l.id !== l.k) setSpot(l.id, l.u, l.v); });
+}
+function canPlace(id, u, v) { // 不出地块、不压城墙、和别的建筑至少隔一格
+  const h = BD[baseOf(id)].n / 2, u0 = u - h, u1 = u + h, v0 = v - h, v1 = v + h;
   if (u0 < 0 || v0 < 0 || u1 > N || v1 > N) return false;
   const inside = u0 >= WALL0 + .5 && v0 >= WALL0 + .5 && u1 <= WALL1 - .5 && v1 <= WALL1 - .5, outside = u1 <= WALL0 - .5 || v1 <= WALL0 - .5;
   if (!inside && !outside) return false;
-  return Object.keys(LOTS).every(o => {
-    if (o === k) return true;
-    const [a, b] = lotUV(o), gap = h + BD[o].n / 2 + 1;
-    return Math.abs(a - u) >= gap || Math.abs(b - v) >= gap;
+  return allLots().every(o => {
+    if (o.id === id) return true;
+    const gap = h + BD[o.k].n / 2 + 1;
+    return Math.abs(o.u - u) >= gap || Math.abs(o.v - v) >= gap;
   });
+}
+function findSpot(id, u, v) { // 点的地方放不下，就挪到最近能放的地方
+  let best = null, bd = 1e9;
+  for (let a = 0; a <= N; a += .5) for (let b = 0; b <= N; b += .5) {
+    const d = Math.hypot(a - u, b - v);
+    if (d < bd && d <= 10 && canPlace(id, a, b)) { bd = d; best = [a, b]; }
+  }
+  return best;
 }
 /* 点按范围，按建筑自身坐标 */
 const HIT = { keep: [-150, -170, 150, 60], farm: [-130, -70, 130, 60], lumber: [-110, -100, 110, 14], mine: [-110, -110, 110, 14], house: [-110, -60, 110, 52], barracks: [-110, -80, 110, 52], yard: [-120, -50, 120, 56], hall: [-110, -110, 110, 56], armory: [-110, -84, 110, 52], hospital: [-110, -70, 110, 52], stable: [-110, -60, 110, 52], wall: [-44, -36, 44, 16], tower: [-34, -130, 34, -10], cata: [-110, -60, 110, 60] };
@@ -2176,15 +2203,17 @@ function drawCastle(dt) {
         if (Math.random() < .55) puff(b, (Math.random() - .5) * (e.r - e.l) * .8, (top - y) / sc, 'dust');
         if (p < 1) { const hx = Math.min(70, (e.r - e.l) * .4); for (const s of [-1, 1]) { line(g, x + s * hx * sc, y, x + s * hx * sc, Math.max(top - 14, dy), C.wood, 2.4 * sc); } line(g, x - hx * sc - 6, top, x + hx * sc + 6, top, C.wood, 2.4 * sc); }
       } else g.drawImage(e.c, dx, dy, dw, dh);
-      if ((U.csel === k || (CS.drag && CS.drag.k === k)) && !i) { g.save(); g.globalCompositeOperation = 'lighter'; g.globalAlpha = .13 + Math.sin(t * 4) * .06; g.drawImage(e.c, dx, dy, dw, dh); g.restore(); }
+      if ((U.csel === k || (CS.drag && CS.drag.id === k)) && !i) { g.save(); g.globalCompositeOperation = 'lighter'; g.globalAlpha = .13 + Math.sin(t * 4) * .06; g.drawImage(e.c, dx, dy, dw, dh); g.restore(); }
       if (live && !(fx && !fx.old && t - fx.t0 < 1.2)) { g.save(); g.translate(x, y); g.scale(sc, sc); d.act.call(d, g, b, t, dt, D, i || 0); g.restore(); }
     } });
     return e;
   };
   const lights = [];
-  Object.keys(L.spots).forEach(k => {
-    if (k === 'wall') return;
-    const [x, y, sc] = L.spots[k];
+  Object.keys(L.spots).forEach(id => {
+    const k = baseOf(id);
+    if (k === 'wall' || (k !== 'tower' && !lvOf(k))) return;
+    const [x, y, sc] = L.spots[id];
+    if (id !== k) { add(k, x, y, sc, 9); return; }
     if (k === 'tower') { const n = Math.max(1, Math.min(S.bld.tower, 3)); for (let i = 0; i < n; i++) { const [tx, ty] = L.towers[i], e = add(k, tx, ty, sc, i); if (S.bld.tower) lights.push([e, tx, ty, sc]); } return; }
     if (k === 'cata') { const n = Math.max(1, Math.min(S.bld.cata, 3)); for (let i = 0; i < n; i++) { const [cx, cy] = L.catas[i]; add(k, cx, cy, sc, i); } return; }
     const e = add(k, x, y, sc); if (lvOf(k)) lights.push([e, x, y, sc]);
@@ -2218,6 +2247,7 @@ function drawCastle(dt) {
       g.restore();
     } });
   });
+  if (U.place) { const [a, b] = U.place, h = 1 + Math.sin(t * 4) * .08; pathOf(g, [A(a - h, b - h), A(a + h, b - h), A(a + h, b + h), A(a - h, b + h)]); g.fillStyle = 'rgba(255,224,138,.3)'; g.fill(); g.strokeStyle = '#ffe08a'; g.lineWidth = 2.4; g.stroke(); }
   /* 太阳走，影子跟着转 */
   const shA = clamp(sunH * 1.5, 0, 1) * .34, skx = Math.cos(day * TAU) * .95, sky = -.3;
   if (shA > .01) {
@@ -2233,8 +2263,8 @@ function drawCastle(dt) {
   items.sort((a, b) => a.y - b.y).forEach(it => it.f());
   if (CS.drag) { /* 拖动中：别的建筑标出占地，手上这栋标绿或红 */
     const dr = CS.drag;
-    Object.keys(LOTS).forEach(k => { if (k === dr.k) return; const [a, b] = lotUV(k), h = BD[k].n / 2 + 1; pathOf(g, [A(a - h, b - h), A(a + h, b - h), A(a + h, b + h), A(a - h, b + h)]); g.fillStyle = 'rgba(200,50,40,.2)'; g.fill(); g.strokeStyle = 'rgba(255,170,150,.5)'; g.lineWidth = 1.5; g.stroke(); });
-    const h = BD[dr.k].n / 2; pathOf(g, [A(dr.u - h, dr.v - h), A(dr.u + h, dr.v - h), A(dr.u + h, dr.v + h), A(dr.u - h, dr.v + h)]);
+    allLots().forEach(o => { if (o.id === dr.id) return; const a = o.u, b = o.v, h = BD[o.k].n / 2 + 1; pathOf(g, [A(a - h, b - h), A(a + h, b - h), A(a + h, b + h), A(a - h, b + h)]); g.fillStyle = 'rgba(200,50,40,.2)'; g.fill(); g.strokeStyle = 'rgba(255,170,150,.5)'; g.lineWidth = 1.5; g.stroke(); });
+    const h = BD[baseOf(dr.id)].n / 2; pathOf(g, [A(dr.u - h, dr.v - h), A(dr.u + h, dr.v - h), A(dr.u + h, dr.v + h), A(dr.u - h, dr.v + h)]);
     g.fillStyle = dr.ok ? 'rgba(90,220,120,.36)' : 'rgba(235,70,60,.42)'; g.fill(); g.strokeStyle = dr.ok ? '#c8ffd6' : '#ffc4bd'; g.lineWidth = 3; g.stroke();
   }
   /* 投石 */
@@ -2358,12 +2388,12 @@ function sizeCastle(host, board) {
   CS.spr.clear();
 }
 function labels() {
-  const L = CS.lay, list = Object.keys(L.spots).filter(k => HIT[k]).sort((a, b) => L.spots[a][1] - L.spots[b][1]);
-  return list.map(k => {
-    const [x, y, sc] = L.spots[k], h = HIT[k], px = CS.ox + (x + h[0] * sc) * CS.k, py = CS.oy + (y + h[1] * sc) * CS.k, w = (h[2] - h[0]) * sc * CS.k, ht = (h[3] - h[1]) * sc * CS.k;
+  const L = CS.lay, list = Object.keys(L.spots).filter(id => { const k = baseOf(id); return HIT[k] && (k === 'wall' || k === 'tower' || lvOf(k)); }).sort((a, b) => L.spots[a][1] - L.spots[b][1]);
+  return list.map(id => {
+    const k = baseOf(id), [x, y, sc] = L.spots[id], h = HIT[k], px = CS.ox + (x + h[0] * sc) * CS.k, py = CS.oy + (y + h[1] * sc) * CS.k, w = (h[2] - h[0]) * sc * CS.k, ht = (h[3] - h[1]) * sc * CS.k;
     if (k === 'yard') return `<button class="bd yardhit${U.csel === 'barracks' ? ' on' : ''}" data-a="bpick" data-k="barracks" data-m="yard" style="left:${px.toFixed(1)}px;top:${py.toFixed(1)}px;width:${w.toFixed(1)}px;height:${ht.toFixed(1)}px" aria-label="校场，打开兵营"></button>`;
     const name = k === 'keep' ? '主堡' : BUILD[k].n, lv = lvOf(k), info = lv ? lv + ' 级' : '未建';
-    return `<button class="bd${U.csel === k ? ' on' : ''}${lv ? '' : ' off'}${canUp(k) ? ' up' : ''}" data-a="bpick" data-k="${k}" style="left:${px.toFixed(1)}px;top:${py.toFixed(1)}px;width:${w.toFixed(1)}px;height:${ht.toFixed(1)}px" aria-label="${name}，${info}"><span>${name}<i>${lv || '空地'}</i></span></button>`;
+    return `<button class="bd${U.csel === k ? ' on' : ''}${lv ? '' : ' off'}${canUp(k) ? ' up' : ''}" data-a="bpick" data-k="${k}" data-m="${id}" style="left:${px.toFixed(1)}px;top:${py.toFixed(1)}px;width:${w.toFixed(1)}px;height:${ht.toFixed(1)}px" aria-label="${name}，${info}"><span>${name}<i>${lv || '空地'}</i></span></button>`;
   }).join('');
 }
 function canUp(k) {
@@ -2378,15 +2408,15 @@ function boardUV(x, y) {
   return [(a + c) / 2, (c - a) / 2];
 }
 function aim(x, y) {
-  const D = CS.drag, [pu, pv] = boardUV(x, y), n = BD[D.k].n / 2, u = clamp(Math.round((pu + D.du) * 2) / 2, n, N - n), v = clamp(Math.round((pv + D.dv) * 2) / 2, n, N - n);
-  D.x = x; D.y = y; D.u = u; D.v = v; D.ok = canPlace(D.k, u, v); setSpot(D.k, u, v);
+  const D = CS.drag, [pu, pv] = boardUV(x, y), n = BD[baseOf(D.id)].n / 2, u = clamp(Math.round((pu + D.du) * 2) / 2, n, N - n), v = clamp(Math.round((pv + D.dv) * 2) / 2, n, N - n);
+  D.x = x; D.y = y; D.u = u; D.v = v; D.ok = canPlace(D.id, u, v); setSpot(D.id, u, v);
 }
 function lift() {
   const P = press; if (!P || !S || U.screen !== 'game' || U.tab !== 'castle') return;
   clearTimeout(P.timer); press = null;
-  if (U.csel) { U.csel = null; render(); }
-  const [u, v] = lotUV(P.k), [pu, pv] = boardUV(P.x0, P.y0);
-  CS.drag = { k: P.k, du: u - pu, dv: v - pv, u, v, ok: true, x: P.x, y: P.y, from: [u, v] };
+  if (U.csel || U.place) { U.csel = null; U.place = null; render(); }
+  const lot0 = allLots().find(l => l.id === P.k), u = lot0.u, v = lot0.v, [pu, pv] = boardUV(P.x0, P.y0);
+  CS.drag = { id: P.k, du: u - pu, dv: v - pv, u, v, ok: true, x: P.x, y: P.y, from: [u, v] };
   const box = document.querySelector('.bds'); if (box) box.classList.add('dragging');
   try { navigator.vibrate && navigator.vibrate(15); } catch (e) { /* 没有震动就算了 */ }
   sfx.click(); aim(P.x, P.y); kick();
@@ -2396,11 +2426,12 @@ function drop(keep) {
   if (keep) { CS.noClick = true; setTimeout(() => { CS.noClick = false; }, 350); } // 被系统取消的拖动后面没有点击
   const moved = D.u !== D.from[0] || D.v !== D.from[1];
   if (keep && D.ok && moved) {
-    S.base = S.base || {}; S.base[D.k] = [D.u, D.v]; save(); sfx.click();
-    const [x, y, sc] = CS.lay.spots[D.k]; puff({ x, y, s: sc }, 0, 0, 'dust', 12);
+    if (D.id.includes('#')) { const [k, i] = D.id.split('#'); S.extra[k][+i] = [D.u, D.v]; } else { S.base = S.base || {}; S.base[D.id] = [D.u, D.v]; }
+    save(); sfx.click();
+    const [x, y, sc] = CS.lay.spots[D.id]; puff({ x, y, s: sc }, 0, 0, 'dust', 12);
   } else {
-    setSpot(D.k, D.from[0], D.from[1]);
-    if (keep && moved) { const [x, y] = CS.lay.spots[D.k]; floatText(x, y - 50, '这里放不下', '#ff9c9c'); }
+    setSpot(D.id, D.from[0], D.from[1]);
+    if (keep && moved) { const [x, y] = CS.lay.spots[D.id]; floatText(x, y - 50, '这里放不下', '#ff9c9c'); }
   }
   render();
 }
@@ -2412,7 +2443,7 @@ function edgeScroll() { // 拖到屏幕边上，地图跟着走
 document.addEventListener('pointerdown', e => {
   const el = e.target.closest && e.target.closest('.bd[data-k]');
   if (!el || U.screen !== 'game') return;
-  const k = el.dataset.m || el.dataset.k; if (!LOTS[k]) return;
+  const k = el.dataset.m || el.dataset.k; if (!LOTS[baseOf(k)]) return;
   press = { k, id: e.pointerId, x0: e.clientX, y0: e.clientY, x: e.clientX, y: e.clientY, touch: e.pointerType !== 'mouse', timer: setTimeout(lift, 340) };
 });
 document.addEventListener('pointermove', e => {
@@ -2461,9 +2492,16 @@ function mount() {
 }
 return {
   CS, mount, SEASON, season,
-  reset() { S.base = null; },
+  reset() { // 恢复默认布局，多建的那些挪到最近的空地
+    S.base = null;
+    Object.keys(S.extra || {}).forEach(k => S.extra[k].forEach((q, i) => { const id = `${k}#${i}`; if (!canPlace(id, q[0], q[1])) { S.extra[k][i] = [-20, -20]; const f = findSpot(id, q[0], q[1]) || findSpot(id, 2.5, 2.5) || [2.5, 2.5]; S.extra[k][i] = f; } }));
+  },
+  /* 点空地 */
+  uv(e) { return boardUV(e.clientX, e.clientY); },
+  inField(u, v) { return u >= 0 && v >= 0 && u <= N && v <= N; },
+  spot(k, u, v) { const id = k; return findSpot(id, u, v); },
   /* 面板让开被点的建筑：横屏看左右，竖屏看上下 */
-  flip(k) { const s = LAY.spots[k]; return innerHeight > innerWidth ? s[1] > LAY.cy + 20 : s[0] > LAY.cx + 20; },
+  flip(k) { const s = LAY.spots[k] || A(k[0], k[1]); return innerHeight > innerWidth ? s[1] > LAY.cy + 20 : s[0] > LAY.cx + 20; },
   built(k, txt) { if (!calm()) CS.fx = CS.fx.filter(f => f.k !== k).concat({ k, t0: CS.t, txt, old: lvOf(k) - 1 }); },
   recruit(id) { CS.arrive[id] = CS.t; },
   month(inc) { CS.month = inc; },
@@ -2900,7 +2938,7 @@ function topBar() {
 }
 function renderGame() {
   if (S.dev) Object.keys(RES).forEach(k => { S.res[k] = 99999; });
-  const old = $('.sheet'), y = old ? old.scrollTop : 0, key = `${U.tab}|${U.csel}|${U.sel}`, same = key === U.sheetKey, ws = $('#wscroll');
+  const old = $('.sheet'), y = old ? old.scrollTop : 0, key = `${U.tab}|${U.csel}|${U.sel}|${U.place}`, same = key === U.sheetKey, ws = $('#wscroll');
   U.wsc = ws ? [ws.scrollLeft, ws.scrollTop] : U.tab === 'map' ? U.wsc : null; // 地图重画时停在原处
   const cs = $('#sscroll'); U.csc = cs ? [cs.scrollLeft, cs.scrollTop] : U.tab === 'castle' ? U.csc : null;
   const body = (U.tab === 'castle' ? tabCastle : tabMap)();
@@ -2910,7 +2948,7 @@ function renderGame() {
   Scene.mount(); World.mount();
 }
 /* 主堡面板里打开世界地图，世界地图点灰鸦堡或回主堡按钮回来 */
-function goTo(v) { U.go = v === 'castle' ? 'in' : 'out'; U.tab = v; U.sel = null; U.csel = null; sfx.click(); render(); }
+function goTo(v) { U.go = v === 'castle' ? 'in' : 'out'; U.tab = v; U.sel = null; U.csel = null; U.place = null; sfx.click(); render(); }
 function alertsHTML() { return `<div class="alerts">${S.alerts.map(a => `<div>${FAC[a.fac].n} ${a.eta} 个月后到达${MAP[a.target].name}</div>`).join('')}</div>`; }
 function tabMap() {
   const zones = World.overlay({ can: i => !S.sortie && attackable(S, i), sel: U.sel });
@@ -2941,19 +2979,29 @@ function sheet(i) {
 function workerRow(k, lab, per) {
   return `<div class="row"><div class="grow"><span class="name">${lab}</span><small>每人每月约 ${per}，最多 ${workerCap(S, k)} 人</small></div><div class="stepper"><button class="btn" data-a="work" data-k="${k}" data-d="-1" aria-label="减少${lab}人手">−</button><b>${S.work[k]}</b><button class="btn" data-a="work" data-k="${k}" data-d="1" aria-label="增加${lab}人手">+</button></div></div>`;
 }
-const WORK = { farm: ['种地', '粮', S => 3 + S.bld.farm], lumber: ['伐木', '木', S => 2 + S.bld.lumber], mine: ['采矿', '铁', S => 1 + .5 * S.bld.mine] };
+const WORK = { farm: ['种地', '粮', S => 3 + eff(S, 'farm')], lumber: ['伐木', '木', S => 2 + eff(S, 'lumber')], mine: ['采矿', '铁', S => 1 + .5 * eff(S, 'mine')] };
 function bldAction(k) {
   const b = BUILD[k], lv = S.bld[k], cost = bldCost(S, k), max = Math.min(5, S.castle + 1);
   const locked = (b.need || 1) > S.castle, atMax = lv >= max, noLand = !lv && landUsed(S) >= landMax(S);
   const btn = locked ? `<span class="tag">主堡 ${b.need} 级解锁</span>` : atMax ? `<span class="tag">${lv >= 5 ? '等级已满' : '先升主堡'}</span>` : noLand ? `<span class="tag bad">没有空地</span>` : `<button class="btn gold" data-a="build" data-k="${k}" ${canPay(S, cost) ? '' : 'disabled'}>${lv ? `升到 ${lv + 1} 级` : '建造'}</button>`;
   return { btn, price: locked || atMax ? '' : priceHTML(cost) };
 }
+function placeSheet() { // 点空地弹出：这块地上能建什么
+  const free = landMax(S) - landUsed(S), max = Math.min(5, S.castle + 1), rows = Object.keys(BUILD).filter(k => k !== 'wall' && k !== 'tower').map(k => {
+    const b = BUILD[k], lv = S.bld[k], again = lv > 0;
+    if (again && !COPYABLE[k]) return '';
+    const cost = again ? copyCost(S, k) : bldCost(S, k), n = copies(S, k), locked = (b.need || 1) > S.castle, full = again && n >= copyMax(S);
+    const btn = locked ? `<span class="tag">主堡 ${b.need} 级解锁</span>` : full ? `<span class="tag">主堡 ${n + 2} 级可再建</span>` : free <= 0 ? '<span class="tag bad">没有土地</span>' : `<button class="btn small gold" data-a="putB" data-k="${k}" ${canPay(S, cost) ? '' : 'disabled'}>建在这里</button>`;
+    return `<div class="row"><div class="grow"><span class="name">${b.n}</span>${again ? ` <span class="lv">已有 ${n + 1} 座，再建效果 +1 级</span>` : ''}<small>${b.d}</small>${locked || full ? '' : `<span class="price">${priceHTML(cost)} · 占 1 块地</span>`}</div>${btn}</div>`;
+  }).join('');
+  return `<aside class="sheet"><h2>这块空地</h2><p class="hint">土地已用 ${landUsed(S)} / ${landMax(S)} 块。主堡每升一级多 2 块，也可以到主堡开垦，或占领村庄、林场、矿山。</p>${rows}<div class="foot"><button class="btn" data-a="closePlace">关闭</button></div></aside>`;
+}
 function buildSheet(k) {
   const close = '<button class="btn" data-a="closeB">关闭</button>';
   if (k === 'keep') {
     const m = moraleMul(S), cc = CASTLE_COST[S.castle], rc = reclaimCost(S);
     return `<aside class="sheet"><h2>主堡 <span class="lv">${S.castle} 级</span></h2><button class="btn gold bigbtn" data-a="tab" data-v="map">打开世界地图</button><p>解锁建筑，建筑等级上限是主堡等级 +1。${S.breach ? `已经被攻破 ${S.breach} 次，三次就是末路。` : ''}</p>
-      <div class="kv"><span>民心</span><span>${Math.round(S.morale)}，产出 ×${m.toFixed(2)}${S.morale < 40 ? '，征兵变慢' : ''}</span><span>闲置</span><span>${idle(S)} 人，每人每月约 ${m.toFixed(1)} 金</span><span>土地</span><span>已用 ${landUsed(S)} / ${landMax(S)} 块</span><span>城防</span><span>城墙 ${S.bld.wall} 级，箭塔 ${S.bld.tower}，投石机 ${S.bld.cata}</span><span>城破</span><span>${S.breach} / 3 次</span></div>
+      <div class="kv"><span>民心</span><span>${Math.round(S.morale)}，产出 ×${m.toFixed(2)}${S.morale < 40 ? '，征兵变慢' : ''}</span><span>闲置</span><span>${idle(S)} 人，每人每月约 ${m.toFixed(1)} 金</span><span>土地</span><span>已用 ${landUsed(S)} / ${landMax(S)} 块，主堡每升一级多 2 块</span><span>城防</span><span>城墙 ${S.bld.wall} 级，箭塔 ${S.bld.tower}，投石机 ${S.bld.cata}</span><span>城破</span><span>${S.breach} / 3 次</span></div>
       <div class="row"><div class="grow"><span class="name">开垦</span><small>每种建筑占 1 块地，占领村庄、林场、矿山也能扩地</small><span class="price">${priceHTML(rc)}</span></div><button class="btn small" data-a="reclaim" ${canPay(S, rc) ? '' : 'disabled'}>开垦</button></div>
       ${S.base ? '<p><button class="btn small" data-a="resetBase">恢复默认布局</button></p>' : ''}${cc ? `<p class="price">升级花费：${priceHTML(cc)}</p>` : ''}<div class="foot">${cc ? `<button class="btn" data-a="castle" ${canPay(S, cc) ? '' : 'disabled'}>升到 ${S.castle + 1} 级</button>` : '<span class="tag">已是最高级</span>'}${close}</div></aside>`;
   }
@@ -2968,8 +3016,8 @@ function buildSheet(k) {
   return `<aside class="sheet${wide ? ' wide' : ''}">${yard}<h2>${b.n} <span class="lv">${lv ? lv + ' 级' : '未建'}</span></h2><p>${b.d}</p>${body}${act.price ? `<p class="price">${lv ? '升级' : '建造'}花费：${act.price}</p>` : ''}<div class="foot">${act.btn}${close}</div></aside>`;
 }
 function tabCastle() {
-  const free = idle(S), left = Math.max(0, trainMax(S) - S.trained), sheetHTML = U.csel ? buildSheet(U.csel).replace('<aside class="sheet', `<aside class="sheet${Scene.flip(U.csel) ? ' flip' : ''}`) : '';
-  return `<div class="scene" id="scene"><div class="sscroll" id="sscroll"><div class="sboard"><div class="bds"></div></div></div><div class="chips"><span>${Scene.SEASON[Scene.season()]}季</span><span>土地 ${landUsed(S)}/${landMax(S)}</span><span>闲置 ${free} 人</span><span>可训练 ${left} 人</span></div>${sheetHTML}${U.csel ? '' : `<div class="coach">${S.sortie ? '本月已出征，安排好经营就结束本月。' : '点主堡打开世界地图。长按建筑可以拖动摆放。'}</div>`}${alertsHTML()}</div>`;
+  const free = idle(S), left = Math.max(0, trainMax(S) - S.trained), sheetHTML = U.csel ? buildSheet(U.csel).replace('<aside class="sheet', `<aside class="sheet${Scene.flip(U.csel) ? ' flip' : ''}`) : U.place ? placeSheet().replace('<aside class="sheet', `<aside class="sheet${Scene.flip(U.place) ? ' flip' : ''}`) : '';
+  return `<div class="scene" id="scene"><div class="sscroll" id="sscroll"><div class="sboard" data-a="ground"><div class="bds"></div></div></div><div class="chips"><span>${Scene.SEASON[Scene.season()]}季</span><span>土地 ${landUsed(S)}/${landMax(S)}</span><span>闲置 ${free} 人</span><span>可训练 ${left} 人</span></div>${sheetHTML}${U.csel || U.place ? '' : `<div class="coach">${S.sortie ? '本月已出征，安排好经营就结束本月。' : '点空地建造，长按建筑挪位置，点主堡打开世界地图。'}</div>`}${alertsHTML()}</div>`;
 }
 function armyRows() {
   const left = trainMax(S) - S.trained;
@@ -3029,6 +3077,7 @@ function modalHTML() {
 }
 const HELP = `<ul>
 <li>一回合是一个月：结算资源，可以建造、训练，出征一次。</li>
+<li>点城里的空地就能在那里建造。主堡每升一级多 2 块土地、多一次多建的名额，农田、伐木场、矿场、民居、兵营可以多建，多一座算多一级效果。</li>
 <li>城里长按建筑可以拖到别处。绿色能放，红色放不下；建筑之间要隔一格，不能压城墙。</li>
 <li>布阵决定胜负。步兵放最靠敌人的一列；弓兵放最后一列射程 +1，放前排会被压制；骑兵放最上或最下一行才会绕后冲锋。</li>
 <li>英雄的光环只影响相邻格子或同一列。前排连续 4 名步兵结成盾墙。</li>
@@ -3572,7 +3621,23 @@ const A = {
   cont() { if (loadSave()) { U.screen = 'game'; U.tab = 'castle'; resume(); } },
   start(e) { S = newGame(e.dataset.k); UID = 100; S.troops.forEach(t => { t.id = UID++; }); U.screen = 'game'; U.tab = 'castle'; U.starter = false; save(); render(); },
   tab(e) { goTo(e.dataset.v); },
-  bpick(e) { const k = e.dataset.k; U.csel = U.csel === k ? null : k; sfx.click(); render(); },
+  bpick(e) { const k = e.dataset.k; U.csel = U.csel === k ? null : k; U.place = null; sfx.click(); render(); },
+  ground(el, e) { // 点空地：有面板就先关，否则在这里盖房
+    if (U.csel || U.place) { U.csel = null; U.place = null; render(); return; }
+    const [u, v] = Scene.uv(e); if (!Scene.inField(u, v)) return;
+    U.place = [Math.round(u * 2) / 2, Math.round(v * 2) / 2]; sfx.click(); render();
+  },
+  closePlace() { U.place = null; render(); },
+  putB(e) {
+    const k = e.dataset.k, again = S.bld[k] > 0, c = again ? copyCost(S, k) : bldCost(S, k);
+    if (!canPay(S, c) || landUsed(S) >= landMax(S) || (again && (!COPYABLE[k] || copies(S, k) >= copyMax(S)))) return;
+    const id = again ? `${k}#${copies(S, k)}` : k, at = Scene.spot(id, U.place[0], U.place[1]);
+    if (!at) { U.modal = { title: '放不下', html: '<p>这附近没有够大的空地，换个地方，或者长按别的建筑挪开一点。</p>' }; U.place = null; render(); return; }
+    pay(S, c);
+    if (again) { S.extra = S.extra || {}; (S.extra[k] = S.extra[k] || []).push(at); }
+    else { S.bld[k] = 1; S.base = S.base || {}; S.base[k] = at; Scene.built(k, `${BUILD[k].n} 1 级`); }
+    sfx.click(); save(); U.place = null; render();
+  },
   closeB() { U.csel = null; render(); },
   resetBase() { Scene.reset(); save(); sfx.click(); render(); },
   dev() { // 开发者模式：粮木铁金花不完，关掉后回到打开前的数目
@@ -3609,7 +3674,7 @@ const A = {
     if (!S.bld[k] && landUsed(S) >= landMax(S)) return;
     pay(S, c); S.bld[k]++; sfx.click(); Scene.built(k, `${BUILD[k].n} ${S.bld[k]} 级`); save(); U.csel = null; render();
   },
-  castle() { const c = CASTLE_COST[S.castle]; if (c && canPay(S, c)) { pay(S, c); S.castle++; sfx.horn(); Scene.built('keep', `主堡 ${S.castle} 级`); save(); U.csel = null; render(); } },
+  castle() { const c = CASTLE_COST[S.castle]; if (c && canPay(S, c)) { pay(S, c); S.castle++; sfx.horn(); Scene.built('keep', `主堡 ${S.castle} 级，土地 +2`); save(); U.csel = null; render(); } },
   reclaim() { const c = reclaimCost(S); if (canPay(S, c)) { pay(S, c); S.reclaim++; Scene.land(); save(); render(); } },
   train(e) {
     const k = e.dataset.k, d = UNITS[k];
@@ -3670,7 +3735,7 @@ document.addEventListener('click', e => {
   const el = e.target.closest('[data-a]');
   if (!el || !el.dataset.a) return;
   audio();
-  const f = A[el.dataset.a]; if (f) f(el);
+  const f = A[el.dataset.a]; if (f) f(el, e);
 });
 document.addEventListener('keydown', e => {
   if (U.screen !== 'battle') return;
