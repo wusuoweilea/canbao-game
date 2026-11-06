@@ -2888,12 +2888,12 @@ function priceHTML(c) {
 function topBar() {
   const inc = income(S), total = S.pop + soldiersAll(S);
   const res = Object.keys(RES).map(k => `<span class="r"><b>${RES[k]}</b>${S.dev ? '∞' : S.res[k]}<i class="${inc[k] < 0 ? 'neg' : ''}">${inc[k] >= 0 ? '+' : ''}${inc[k]}</i></span>`).join('');
-  return `<div class="top"><span class="date">${dateText()}</span>${res}
+  return `<div class="top"><span class="date" data-a="dateTap">${dateText()}</span>${res}
     <span class="r"><b>人口</b>${total}/${popCap(S)}</span>
     <span class="r"><b>民心</b>${Math.round(S.morale)}</span>
     <span class="r"><b>领主</b>${S.lord.lv} 级</span>
     <span class="sp"></span>
-    <button class="iconbtn${S.dev ? ' devon' : ''}" data-a="dev" aria-pressed="${!!S.dev}">${S.dev ? '开发者 开' : '开发者'}</button>
+    ${S.dev ? '<button class="iconbtn devon" data-a="dev" aria-pressed="true">开发者 开</button>' : ''}
     <button class="iconbtn" data-a="help">玩法</button>
     <button class="iconbtn" data-a="sound">${U.sound ? '声音开' : '声音关'}</button>
     <button class="btn gold endbtn" data-a="endTurn">结束本月</button></div>`;
@@ -3578,6 +3578,10 @@ const A = {
   dev() { // 开发者模式：粮木铁金花不完，关掉后回到打开前的数目
     if (S.dev) { S.res = S.dev; S.dev = null; } else { S.dev = { ...S.res }; }
     save(); sfx.click(); render();
+  },
+  dateTap() { // 暗门：两秒内连点日期五下打开开发者模式
+    const now = Date.now(); U.taps = (U.taps || []).filter(t => now - t < 2000).concat(now);
+    if (U.taps.length >= 5) { U.taps = []; if (!S.dev) A.dev(); }
   },
   sound() { U.sound = !U.sound; if (U.sound) audio(); render(); },
   help() { U.modal = { title: '玩法', html: HELP + '<p><button class="btn small ruby" data-a="restart">放弃存档，重新开局</button></p>' }; render(); },
